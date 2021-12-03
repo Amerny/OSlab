@@ -262,3 +262,308 @@ void *shmat(int shmid, const void *shmaddr, int shmflg);
   这项实验主要是加深对地址转换的理解以及一些细节掌握，建议这块理解不清楚的可以跟着做一下
 
 #### 2. 基于共享内存的生产者—消费者程序
+
+##### 1）编写`shm.c`
+
+```c
+#include <sys/shm.h>
+#include <linux/kernel.h>
+#include <error.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+
+shm_t shms[SHM_SIZE] = {{0, 0, 0}};
+
+/**
+ * 该文件用于实现对共享物理内存空间的操作
+ * 1.创建 
+ * 2.返回逻辑地址，以便于生产者-消费者读写 
+*/
+
+/**
+ * 该系统调用会新建或者打开一页物理内存作为共享内存，返回该共享内存的shmid，
+ * 即该页共享内存在操作系统中的标识，如果多个进程使用相同的key调用shmget()，
+ * 则这些进程就会获得相同的shmid，即得到了同一块共享内存的标识。
+ * 在shmget()实现时，
+ * 如果key所对应的内存已经建立，直接返回shmid，否则新建然后再返回。
+ * 如果size超过一页内存大小，返回-1，并置errno为EINVAL。
+ * 如果系统没有空闲内存了，返回-1，并置errno为ENOMEM。
+ * 参数shmflg在本次实验中可以直接忽略。
+*/
+int shmget(key_t key, size_t size/*, int shmflg*/)
+{
+    int i;
+
+    //得到原来已经创建好的共享内存(在生产者已经创建好了的共享内存，消费者拿着相同的key对应的是同一块内存)
+    for(i = 0; i < SHMS_SIZE; i++)
+    {
+        if(shms[i].key == key)
+        {
+            return i;
+        }
+    }
+
+    //创建新的共享内存
+    for(i = 0; i < SHMS_SIZE; i++);
+    if(i == SHMS_SIZE)
+    {
+        printk("no shm place");
+        errno = ENOMEM;
+        return -1;
+    }
+    if(size > PAGE_SIZE) 
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    shms[i].size = size;
+    shms[i].key = key;
+    if(!(shms[i].addr = get_free_page()))
+    {
+        return ENOMEM;
+    }
+    return i;
+}
+
+/**
+ * 该系统调用会将shmid对应的共享内存页面映射到当前进程的虚拟地址空间中，并返回一个逻辑地址p，
+ * 调用进程可以读写逻辑地址p来读写这一页共享内存。
+ * 两个进程都调用shmat可以关联到同一页物理内存上，此时两个进程读写p指针就是在读写同一页内存，
+ * 从而实现了基于共享内存的进程间通信。
+ * 如果shmid不正确，返回-1，并置errno为EINVAL。
+ * 参数shmaddr和shmflg在本次实验中可以直接忽略。
+*/
+void * shmat(int shmid/*, const void * shmaddr, int shmflg*/);
+{
+    unsigned long logical_addr;
+
+    if(shmid < 0 || shmid >= SHMS_SIZE)
+    {
+        //shmid对应的物理内存不存在
+        errno = EINVAL;
+        return -1;
+    }
+    logival_addr = current->brk;
+    current->brk += PAGE_SIZE;
+    if(!put_page(shms[shmid].addr,current->start_code+logival_addr))
+    {
+        //分页分不出来
+        errno = EINVAL;
+        return -1;
+    }
+
+    //返回共享物理空间对应的逻辑地址
+    return (void)*logival_addr;
+}
+
+```
+
+##### 2）编写`produce.c`和`consumer.c`
+
+```c
+#include <unistd.h>
+#include <syscall.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <stdio.h>
+
+#define BUF_SIZE 10
+#define COUNT 500
+#define KEY 183
+#define SHM_SIZE (BUF_SIZE+1)*sizeof(short)
+
+int main(int argc,char ** argv)
+{
+    int pid;//该进程的id
+    unsigned short count = 0;//生产资源的个数
+    int shm_id;//共享物理内存空间的id
+    short *shmp;//操作共享内存的逻辑地址
+    sem_t *empty;//三个实现进程间的同步
+    sem_t *full;
+    sem_t *mutex;
+
+    //关闭原来的信号量
+    sem_unlink("empty");
+    sum_unlink("full");
+    sum_unlink("mutex");
+
+    //新打开三个信号量
+    empty = sem_open("empty",0_CREAT|O_EXCL,0666,10);
+    full = sem_open("full",0_CREAT|O_EXCL,0666,0);
+    mutex = sem_open("mutex",0_CREAT|O_EXCL,0666,1);
+    if(empty == SEM_FAILED || full == SEM_FAILED || mutex == SEM_FAILED)
+    {
+        //申请信号量失败
+        printf("sem_open error!\n");
+        return -1;
+    }
+
+    //使用KEY值申请一块共享物理内存
+    shm_id = shmget(KEY,SHM_SIZE,IPC_CREAT|0666);
+    if(shm_id == -1)
+    {
+        //申请共享内存失败
+        printf("shmget error!\n");
+        return -1;
+    }
+    shmp = (short*)shmat(shm_id,NULL,0);//返回共享物理内存的逻辑地址
+
+
+    pid = syscall(SYS_getpid);//得到进程的pid
+    
+    //生产者生产出资源
+    while(count <= COUNT)
+    {
+        sem_wait(empty);//P(empty)
+        sem_wait(mutex);//P(mutex)
+
+        printf("Producer 1 process %d : %d\n",pid,count);
+        fflush(stdout);
+        *(shmp++) = count++;
+        if(!(count % BUF_SIZE))
+        {
+            shmp -= 10;
+        }          
+        
+        sem_post(mutex);//V(mutex)
+        sem_post(full);//V(full)
+    }
+    return 0;
+}
+
+```
+
+---
+
+```c
+#include <unistd.h>
+#include <syscall.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <stdio.h>
+
+#define BUF_SIZE 10
+#define KEY 183
+
+int main()
+{
+    int pid;
+    int shm_id;
+    short *shmp;
+    short *index;
+    sem_t *empty;
+    sem_t *full;
+    sem_t *mutex;
+
+    shm_id = shmget(KEY,0,0);//使用和生产者同一个KEY值，会返回同一个shm_id(指向同一个内存空间)
+    if(shm_id == -1)
+    {
+        //申请共享内存失败
+        printf("shmget error!\n");
+        return -1;
+    }
+    shmp = (short*)shmat(shm_id,NULL,0);//返回共享物理内存的逻辑地址
+    index = shmp + BUF_SIZE;
+    *index = 0;
+
+    //打开生产者那里创建的三个信号量
+    empty = sem_open("empty",0);
+    full = sem_open("full",0);
+    mutex = sem_open("mutex",0);
+    if(empty == SEM_FAILED || full == SEM_FAILED || mutex == SEM_FAILED)
+    {
+        //申请信号量失败
+        printf("sem_open error!\n");
+        return -1;
+    }
+
+    if(!sysvall(SYS_fork))
+    {
+        pid = syscall(SYS_getpid);//得到进程的pid
+
+        //消费者1开始消费资源
+        while(1)
+        {
+            sem_wait(full);//P(full)
+            sem_wait(mutex);//P(mutex)
+
+            printf("Consumer 1 process %d : %d\n",pid,shem[*index]);
+            fflush(stdout);
+            if(*index == 9)
+            {
+                *index = 0;
+            }
+            else
+            {
+                (*index)++;
+            }
+
+            sem_post(mutex);//V(mutex)
+            sem_post(empty);//V(empry)
+        }
+        return 0;
+    }
+
+    if(!sysvall(SYS_fork))
+    {
+        pid = syscall(SYS_getpid);//得到进程的pid
+
+        //消费者2开始消费资源
+        while(1)
+        {
+            sem_wait(full);
+            sem_wait(mutex);
+
+            printf("Consumer 2 process %d : %d\n",pid,shem[*index]);
+            fflush(stdout);
+            if(*index == 9)
+            {
+                *index = 0;
+            }
+            else
+            {
+                (*index)++;
+            }
+
+            sem_post(mutex);
+            sem_post(empty);
+        }
+        return 0;
+    }
+
+    if(!sysvall(SYS_fork))
+    {
+        pid = syscall(SYS_getpid);//得到进程的pid
+
+        //消费者3开始消费资源
+        while(1)
+        {
+            sem_wait(full);
+            sem_wait(mutex);
+
+            printf("Consumer 3 process %d : %d\n",pid,shem[*index]);
+            fflush(stdout);
+            if(*index == 9)
+            {
+                *index = 0;
+            }
+            else
+            {
+                (*index)++;
+            }
+
+            sem_post(mutex);
+            sem_post(empty);
+        }
+        return 0;
+    }
+    return 0;
+}
+
+```
+
+
+
+>​                         最后就是编写运行和测试了。
